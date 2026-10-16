@@ -1,6 +1,5 @@
 const DNSHE_API = 'https://api005.dnshe.com/index.php';
 const AUTO_RENEW_KEY = 'auto_renew';
-const AUTO_RENEW_LOGS_KEY = 'auto_renew_logs';
 const AUTO_RENEW_LOCK_KEY = 'auto_renew_lock';
 
 export default {
@@ -42,16 +41,7 @@ async function getAutoRenew(env) {
 
 async function saveAutoRenew(env, cfg) {
   await env.KV.put(AUTO_RENEW_KEY, JSON.stringify(cfg));
-}
-
-async function getAutoRenewLogs(env) {
-  return JSON.parse(await env.KV.get(AUTO_RENEW_LOGS_KEY) || '[]');
-}
-
-async function pushAutoRenewLog(env, entry) {
-  const logs = await getAutoRenewLogs(env);
-  logs.unshift(entry);
-  await env.KV.put(AUTO_RENEW_LOGS_KEY, JSON.stringify(logs.slice(0, 30)));
+  await env.KV.delete('auto_renew_logs');
 }
 
 function sleep(ms) {
@@ -179,12 +169,29 @@ async function listAllSubdomains(env, acc) {
   return out;
 }
 
+function statusAllowed(status, allowed) {
+  if (!Array.isArray(allowed) || !allowed.length) return true;
+  const cur = String(status || '').trim().toLowerCase();
+  if (!cur) return true;
+  const expanded = new Set();
+  for (const raw of allowed) {
+    const key = String(raw || '').trim().toLowerCase();
+    if (!key) continue;
+    expanded.add(key);
+    if (key === 'active' || key === 'registered' || key === '正常' || key === '已注册') {
+      expanded.add('active');
+      expanded.add('registered');
+    }
+  }
+  return expanded.has(cur);
+}
+
 function shouldRenewDomain(d, cfg) {
   if (!d || d.id == null) return { ok: false, reason: '无效域名' };
   if (cfg.skipNeverExpires && (d.never_expires === 1 || d.never_expires === true || d.never_expires === '1')) {
     return { ok: false, reason: '永不过期' };
   }
-  if (Array.isArray(cfg.statuses) && cfg.statuses.length && d.status && !cfg.statuses.includes(d.status)) {
+  if (!statusAllowed(d.status, cfg.statuses)) {
     return { ok: false, reason: '状态不匹配: ' + d.status };
   }
   if (!d.expires_at) return { ok: true, left: null, reason: '没有到期时间，直接请求续期' };
@@ -219,7 +226,7 @@ async function runAutoRenew(env, trigger = 'manual') {
   }
 
   const startedAt = new Date().toISOString();
-  const summary = { accounts: 0, checked: 0, candidates: 0, renewed: 0, skipped: 0, failed: 0 };
+  const summary = { accounts: 0, checked: 0, candidates: 0, renewed: 0, skipped: 0, failed: 0, skipReasons: {} };
   const items = [];
   const accounts = JSON.parse(await env.KV.get('accounts') || '[]');
   const selected = Array.isArray(cfg.accountIds) && cfg.accountIds.length
@@ -245,6 +252,8 @@ async function runAutoRenew(env, trigger = 'manual') {
         const check = shouldRenewDomain(d, cfg);
         if (!check.ok) {
           summary.skipped++;
+          const why = check.reason || '跳过';
+          summary.skipReasons[why] = (summary.skipReasons[why] || 0) + 1;
           continue;
         }
         if (summary.renewed + summary.failed >= Number(cfg.maxPerRun || 80)) {
@@ -301,7 +310,6 @@ async function runAutoRenew(env, trigger = 'manual') {
   cfg.lastRunAt = finishedAt;
   cfg.lastResult = { trigger, startedAt, finishedAt, stopped, summary };
   await saveAutoRenew(env, cfg);
-  await pushAutoRenewLog(env, { id: crypto.randomUUID(), ...result });
   await releaseRenewLock(env);
   return result;
 }
@@ -383,9 +391,6 @@ async function handleAPI(req, env, url) {
     delete cfg.delayMs;
     await saveAutoRenew(env, cfg);
     return json({ success: true, config: cfg });
-  }
-  if (p === '/api/auto-renew/logs' && req.method === 'GET') {
-    return json({ success: true, logs: await getAutoRenewLogs(env) });
   }
   if (p === '/api/auto-renew/run' && req.method === 'POST') {
     const result = await runAutoRenew(env, 'manual');
@@ -586,12 +591,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica N
 .switch input:checked+.slider:before{transform:translateX(20px)}
 .acc-check{display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid #f1f5f9;font-size:13px}
 .acc-check:last-child{border:none}
-.log-item{border:1px solid var(--border);border-radius:10px;padding:12px;margin-bottom:10px;background:#fff}
-.log-item .meta{font-size:12px;color:var(--text2);margin-bottom:6px;display:flex;gap:10px;flex-wrap:wrap}
-.log-chip{display:inline-flex;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}
-.log-chip.ok{background:#dcfce7;color:#15803d}
-.log-chip.fail{background:#fee2e2;color:#b91c1c}
-.log-chip.skip{background:#f1f5f9;color:#64748b}
 .mobile-header{display:none;background:var(--sidebar-bg);padding:12px 16px;align-items:center;justify-content:space-between}
 .mobile-header h2{color:#fff;font-size:18px;font-weight:600}
 .hamburger{background:none;border:none;color:#fff;font-size:24px;cursor:pointer;padding:4px 8px}
@@ -664,9 +663,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica N
 <script>
 let token='',accounts=[],currentAcc=null,domainData={},expandedDomains=new Set();
 let uiTab='domains',domainQuery={page:1,per_page:50,search:'',rootdomain:'',status:'',created_from:'',created_to:'',sort_by:'id',sort_dir:'desc',include_total:true};
-let domainPage=null,dnsCache={},upgradePage=1,lastSecret=null,autoRenewCfg=null,autoRenewLogs=[],autoRenewRunning=false;
+let domainPage=null,dnsCache={},upgradePage=1,lastSecret=null,autoRenewCfg=null,autoRenewRunning=false;
 
-const STATUS_ZH={active:'正常',suspended:'已暂停',expired:'已过期',pending:'待处理',unregistered:'未注册'};
+const STATUS_ZH={active:'正常',registered:'已注册',suspended:'已暂停',expired:'已过期',pending:'待处理',unregistered:'未注册'};
 const DNS_TYPES=['A','AAAA','CNAME','MX','TXT','NS','SRV','CAA'];
 
 async function doLogin(){
@@ -763,8 +762,9 @@ function clearRenewLog(){
   if(box) box.innerHTML='';
 }
 function statusBadge(s){
-  const cls=s==='active'?'badge-active':s==='pending'?'badge-pending':s==='suspended'||s==='expired'?'badge-inactive':'badge-info';
-  return '<span class="badge '+cls+'">'+(STATUS_ZH[s]||s||'未知')+'</span>';
+  const key=String(s||'').trim().toLowerCase();
+  const cls=key==='active'||key==='registered'?'badge-active':key==='pending'?'badge-pending':key==='suspended'||key==='expired'?'badge-inactive':'badge-info';
+  return '<span class="badge '+cls+'">'+(STATUS_ZH[key]||s||'未知')+'</span>';
 }
 function domainName(d){return d.full_domain||((d.subdomain||'')+'.'+(d.rootdomain||''))}
 function recordLocator(rec){
@@ -820,13 +820,9 @@ async function showAutoRenew(){
 }
 async function loadAutoRenew(){
   try{
-    const [cfgRes,logRes]=await Promise.all([
-      api('/api/auto-renew'),
-      api('/api/auto-renew/logs')
-    ]);
+    const cfgRes=await api('/api/auto-renew');
     autoRenewCfg=cfgRes.config||{};
     autoRenewRunning=!!cfgRes.running;
-    autoRenewLogs=logRes.logs||[];
     renderAutoRenew();
   }catch(e){
     document.getElementById('autoRenewView').innerHTML='<div class="empty-state"><p>加载失败: '+esc(e.message)+'</p></div>';
@@ -864,7 +860,7 @@ function renderAutoRenew(){
       </div>
       <div class="form-row">
         <div class="form-group"><label>请求频率</label><input value="每账号最多 30 次/分钟" disabled style="background:#f1f5f9"><div class="hint">页面、批量续期和定时任务都走这个上限，调不更快。</div></div>
-        <div class="form-group"><label>仅这些状态</label><input id="ar_status" value="\${esc((c.statuses||[]).join(','))}" placeholder="active，留空表示全部"><div class="hint">逗号分隔，例如 active 或 active,suspended</div></div>
+        <div class="form-group"><label>仅这些状态</label><input id="ar_status" value="\${esc((c.statuses||[]).join(','))}" placeholder="留空表示全部"><div class="hint">填 active 时会同时续 registered（已注册）。留空则不按状态过滤。</div></div>
       </div>
       <div class="form-row">
         <label class="checkline"><input type="checkbox" id="ar_skip_never" \${c.skipNeverExpires!==false?'checked':''}> 跳过永不过期域名</label>
@@ -876,27 +872,7 @@ function renderAutoRenew(){
       <div id="ar_accounts">
         \${accounts.length?accounts.map(a=>\`<label class="acc-check"><input type="checkbox" class="ar_acc" value="\${a.id}" \${selected.has(a.id)?'checked':''}> \${esc(a.name)}</label>\`).join(''):'<div class="dns-empty">请先添加账号</div>'}
       </div>
-    </div>
-    <div class="section-title">运行日志</div>
-    <div id="ar_logs">\${renderAutoRenewLogs()}</div>\`;
-}
-function renderAutoRenewLogs(){
-  if(!autoRenewLogs.length) return '<div class="empty-state"><p>还没有运行记录</p></div>';
-  return autoRenewLogs.map(log=>{
-    const s=log.summary||{};
-    const detail=(log.items||[]).filter(i=>i.action==='renewed'||i.action==='failed'||i.action==='stopped').slice(0,40);
-    return \`<div class="log-item">
-      <div class="meta">
-        <span>\${esc(log.startedAt||'-')} → \${esc(log.finishedAt||'-')}</span>
-        <span>\${esc(log.trigger||'-')}</span>
-        <span class="log-chip ok">成功 \${s.renewed||0}</span>
-        <span class="log-chip fail">失败 \${s.failed||0}</span>
-        <span class="log-chip skip">跳过 \${s.skipped||0}</span>
-        <span>检查 \${s.checked||0} · 候选 \${s.candidates||0}</span>
-      </div>
-      \${detail.length?'<div class="result-box">'+detail.map(i=>'<div class="row"><span class="rk">'+esc((i.accountName?i.accountName+' · ':'')+(i.domain||i.action||''))+'</span><span class="rv">'+esc((i.action||'')+' · '+(i.message||'')+(i.new_expires_at?' → '+i.new_expires_at:''))+'</span></div>').join('')+'</div>':''}
     </div>\`;
-  }).join('');
 }
 async function saveAutoRenew(){
   const accountIds=[...document.querySelectorAll('.ar_acc:checked')].map(el=>el.value);
@@ -923,7 +899,8 @@ async function runAutoRenewNow(){
     if(r.error){toast(r.error,'error')}
     else{
       const s=r.summary||{};
-      toast('完成：成功 '+(s.renewed||0)+'，失败 '+(s.failed||0)+'，跳过 '+(s.skipped||0),'success');
+      const reasons=s.skipReasons?Object.entries(s.skipReasons).map(([k,v])=>v+' 个'+k).join('；'):'';
+      toast('完成：成功 '+(s.renewed||0)+'，失败 '+(s.failed||0)+'，跳过 '+(s.skipped||0)+(reasons?'。'+reasons:''), (s.failed||s.skipped)&&!s.renewed?'warning':'success');
     }
   }catch(e){toast('执行失败: '+e.message,'error')}
   await loadAutoRenew();

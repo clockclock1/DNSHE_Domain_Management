@@ -67,7 +67,7 @@ Worker → **Triggers → Cron Triggers**，添加例如：
 1. 打开 Worker 访问地址，用 `PASSWORD` 登录
 2. **添加账号**：填入 DNSHE 控制台「免费域名管理 → API 管理」里的 API Key / Secret
 3. 选择账号后可管理域名、DNS、密钥、WHOIS、永久升级
-4. 侧边栏 **自动续期** 配置定时规则与查看运行日志
+4. 侧边栏 **自动续期** 配置定时规则
 
 ### 获取 API 凭证
 
@@ -83,7 +83,6 @@ Worker → **Triggers → Cron Triggers**，添加例如：
 - 未进入免费续期窗口（`renewal_not_yet_available`）记为跳过，不算失败
 - 每个 API 账号最多 30 次请求/分钟，由 Worker 统一排队，页面操作和定时任务都不会超过
 - 运行有互斥锁，Cron 与手动执行不会同时进行
-- 最近约 30 次运行日志保存在 KV
 
 ## 项目结构
 

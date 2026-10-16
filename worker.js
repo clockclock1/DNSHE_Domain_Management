@@ -23,20 +23,21 @@ export default {
 function defaultAutoRenew() {
   return {
     enabled: false,
-    daysBefore: 175,
+    daysBefore: 180,
     accountIds: [],
     skipNeverExpires: true,
     statuses: ['active'],
     ignoreNotYetAvailable: true,
     maxPerRun: 80,
-    delayMs: 1100,
     lastRunAt: null,
     lastResult: null
   };
 }
 
 async function getAutoRenew(env) {
-  return { ...defaultAutoRenew(), ...(JSON.parse(await env.KV.get(AUTO_RENEW_KEY) || '{}')) };
+  const cfg = { ...defaultAutoRenew(), ...(JSON.parse(await env.KV.get(AUTO_RENEW_KEY) || '{}')) };
+  delete cfg.delayMs;
+  return cfg;
 }
 
 async function saveAutoRenew(env, cfg) {
@@ -57,23 +58,92 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-async function dnsheRequest(acc, endpoint, action, method = 'GET', data = null, params = null) {
-  let u = `${DNSHE_API}?m=domain_hub&endpoint=${encodeURIComponent(endpoint)}`;
-  if (action) u += `&action=${encodeURIComponent(action)}`;
-  if (params) {
-    Object.entries(params).forEach(([k, v]) => {
-      if (v !== '' && v != null) u += `&${encodeURIComponent(k)}=${encodeURIComponent(v)}`;
-    });
+const RATE_MAX = 30;
+const RATE_WINDOW_MS = 60000;
+const RATE_GAP_MS = 2100;
+const rateLanes = new Map();
+
+function enqueueAccount(apiKey, task) {
+  const id = String(apiKey || '');
+  let lane = rateLanes.get(id);
+  if (!lane) {
+    lane = { times: [], tail: Promise.resolve() };
+    rateLanes.set(id, lane);
   }
-  const m = String(method || 'GET').toUpperCase();
-  const opt = {
-    method: m,
-    headers: { 'X-API-Key': acc.apiKey, 'X-API-Secret': acc.apiSecret, 'Content-Type': 'application/json' }
-  };
-  if (m !== 'GET' && m !== 'HEAD' && data) opt.body = JSON.stringify(data);
-  const r = await fetch(u, opt);
-  const t = await r.text();
-  try { return JSON.parse(t); } catch { return { success: false, error: 'API返回非JSON', raw: t }; }
+  const job = lane.tail.then(() => task(lane));
+  lane.tail = job.then(() => {}, () => {});
+  return job;
+}
+
+async function waitLocalSlot(lane) {
+  for (;;) {
+    const now = Date.now();
+    lane.times = lane.times.filter(t => now - t < RATE_WINDOW_MS);
+    let wait = 0;
+    if (lane.times.length >= RATE_MAX) wait = lane.times[0] + RATE_WINDOW_MS - now + 50;
+    if (lane.times.length) wait = Math.max(wait, lane.times[lane.times.length - 1] + RATE_GAP_MS - now);
+    if (wait > 0) {
+      await sleep(wait);
+      continue;
+    }
+    return;
+  }
+}
+
+async function rateKeyId(apiKey) {
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(apiKey || '')));
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+}
+
+async function alignAccountRate(env, apiKey) {
+  if (!env || !env.KV) return;
+  const key = 'rl:' + await rateKeyId(apiKey);
+  for (let i = 0; i < 40; i++) {
+    let state = { next: 0, times: [] };
+    try { state = { next: 0, times: [], ...JSON.parse(await env.KV.get(key) || '{}') }; } catch { state = { next: 0, times: [] }; }
+    const now = Date.now();
+    const times = (state.times || []).filter(t => now - t < RATE_WINDOW_MS);
+    let wait = 0;
+    if (times.length >= RATE_MAX) wait = times[0] + RATE_WINDOW_MS - now + 50;
+    if (times.length) wait = Math.max(wait, times[times.length - 1] + RATE_GAP_MS - now);
+    wait = Math.max(wait, (state.next || 0) - now);
+    if (wait > 0) {
+      await sleep(Math.min(wait, RATE_GAP_MS));
+      continue;
+    }
+    const stamp = Date.now();
+    const claim = { next: stamp + RATE_GAP_MS, times: [...times, stamp].slice(-RATE_MAX), token: crypto.randomUUID() };
+    await env.KV.put(key, JSON.stringify(claim), { expirationTtl: 180 });
+    let seen = null;
+    try { seen = JSON.parse(await env.KV.get(key) || 'null'); } catch { seen = null; }
+    if (seen && seen.token === claim.token) return;
+    await sleep(120);
+  }
+  throw new Error('账号请求排队超时，未发送，以避免超过 30 次/分钟');
+}
+
+async function dnsheRequest(env, acc, endpoint, action, method = 'GET', data = null, params = null) {
+  return enqueueAccount(acc.apiKey, async (lane) => {
+    await waitLocalSlot(lane);
+    await alignAccountRate(env, acc.apiKey);
+    lane.times.push(Date.now());
+    let u = `${DNSHE_API}?m=domain_hub&endpoint=${encodeURIComponent(endpoint)}`;
+    if (action) u += `&action=${encodeURIComponent(action)}`;
+    if (params) {
+      Object.entries(params).forEach(([k, v]) => {
+        if (v !== '' && v != null) u += `&${encodeURIComponent(k)}=${encodeURIComponent(v)}`;
+      });
+    }
+    const m = String(method || 'GET').toUpperCase();
+    const opt = {
+      method: m,
+      headers: { 'X-API-Key': acc.apiKey, 'X-API-Secret': acc.apiSecret, 'Content-Type': 'application/json' }
+    };
+    if (m !== 'GET' && m !== 'HEAD' && data) opt.body = JSON.stringify(data);
+    const r = await fetch(u, opt);
+    const t = await r.text();
+    try { return JSON.parse(t); } catch { return { success: false, error: 'API返回非JSON', raw: t }; }
+  });
 }
 
 function parseExpiresAt(s) {
@@ -88,24 +158,23 @@ function daysUntil(date) {
   return (date.getTime() - Date.now()) / 86400000;
 }
 
-async function listAllSubdomains(acc) {
+async function listAllSubdomains(env, acc) {
   const out = [];
   let page = 1;
   for (let i = 0; i < 100; i++) {
-    const r = await dnsheRequest(acc, 'subdomains', 'list', 'GET', null, {
+    const r = await dnsheRequest(env, acc, 'subdomains', 'list', 'GET', null, {
       page,
       per_page: 200,
       include_total: 0,
       sort_by: 'expires_at',
-      sort_dir: 'asc',
-      fields: 'id,subdomain,rootdomain,full_domain,status,expires_at,never_expires'
+      sort_dir: 'asc'
     });
     if (!r || r.success === false) throw new Error(r?.message || r?.error || '列出域名失败');
     const list = r.subdomains || [];
     out.push(...list);
-    if (!(r.pagination && r.pagination.has_more) || !list.length) break;
+    const more = r.pagination ? !!r.pagination.has_more : list.length === 200;
+    if (!more || !list.length) break;
     page++;
-    await sleep(400);
   }
   return out;
 }
@@ -118,12 +187,13 @@ function shouldRenewDomain(d, cfg) {
   if (Array.isArray(cfg.statuses) && cfg.statuses.length && d.status && !cfg.statuses.includes(d.status)) {
     return { ok: false, reason: '状态不匹配: ' + d.status };
   }
-  if (!d.expires_at) return { ok: false, reason: '无到期时间' };
+  if (!d.expires_at) return { ok: true, left: null, reason: '没有到期时间，直接请求续期' };
   const exp = parseExpiresAt(d.expires_at);
-  if (!exp) return { ok: false, reason: '到期时间无法解析' };
+  if (!exp) return { ok: true, left: null, reason: '到期时间无法解析，直接请求续期' };
   const left = daysUntil(exp);
-  if (left > Number(cfg.daysBefore)) return { ok: false, reason: `距到期还有 ${Math.ceil(left)} 天` };
-  return { ok: true, left };
+  const windowDays = Number(cfg.daysBefore) || 180;
+  if (left > windowDays) return { ok: false, reason: `距到期还有 ${Math.ceil(left)} 天，未到 ${windowDays} 天窗口` };
+  return { ok: true, left, reason: `距到期 ${Math.ceil(left)} 天` };
 }
 
 async function acquireRenewLock(env) {
@@ -162,7 +232,7 @@ async function runAutoRenew(env, trigger = 'manual') {
       summary.accounts++;
       let domains = [];
       try {
-        domains = await listAllSubdomains(acc);
+        domains = await listAllSubdomains(env, acc);
       } catch (e) {
         summary.failed++;
         items.push({ accountId: acc.id, accountName: acc.name, action: 'failed', message: '列出域名失败: ' + e.message });
@@ -185,7 +255,7 @@ async function runAutoRenew(env, trigger = 'manual') {
         }
         summary.candidates++;
         try {
-          const r = await dnsheRequest(acc, 'subdomains', 'renew', 'POST', { subdomain_id: d.id });
+          const r = await dnsheRequest(env, acc, 'subdomains', 'renew', 'POST', { subdomain_id: d.id });
           if (r && r.success) {
             summary.renewed++;
             items.push({
@@ -219,7 +289,6 @@ async function runAutoRenew(env, trigger = 'manual') {
           summary.failed++;
           items.push({ accountId: acc.id, accountName: acc.name, domain: full, subdomainId: d.id, action: 'failed', message: e.message });
         }
-        await sleep(Number(cfg.delayMs) || 1100);
       }
     }
   } catch (e) {
@@ -305,13 +374,13 @@ async function handleAPI(req, env, url) {
     const b = await req.json();
     const cfg = await getAutoRenew(env);
     if (typeof b.enabled === 'boolean') cfg.enabled = b.enabled;
-    if (b.daysBefore != null) cfg.daysBefore = Math.max(1, Math.min(365, parseInt(b.daysBefore, 10) || 175));
+    if (b.daysBefore != null) cfg.daysBefore = Math.max(1, Math.min(400, parseInt(b.daysBefore, 10) || 180));
     if (Array.isArray(b.accountIds)) cfg.accountIds = b.accountIds.filter(Boolean);
     if (typeof b.skipNeverExpires === 'boolean') cfg.skipNeverExpires = b.skipNeverExpires;
     if (Array.isArray(b.statuses)) cfg.statuses = b.statuses.filter(Boolean);
     if (typeof b.ignoreNotYetAvailable === 'boolean') cfg.ignoreNotYetAvailable = b.ignoreNotYetAvailable;
     if (b.maxPerRun != null) cfg.maxPerRun = Math.max(1, Math.min(300, parseInt(b.maxPerRun, 10) || 80));
-    if (b.delayMs != null) cfg.delayMs = Math.max(300, Math.min(5000, parseInt(b.delayMs, 10) || 1100));
+    delete cfg.delayMs;
     await saveAutoRenew(env, cfg);
     return json({ success: true, config: cfg });
   }
@@ -329,7 +398,7 @@ async function handleAPI(req, env, url) {
       const accs = JSON.parse(await env.KV.get('accounts') || '[]');
       const acc = accs.find(a => a.id === b.accountId);
       if (!acc) return json({ error: '账号不存在' }, 404);
-      const data = await dnsheRequest(acc, b.endpoint, b.action, b.method || 'GET', b.data, b.params);
+      const data = await dnsheRequest(env, acc, b.endpoint, b.action, b.method || 'GET', b.data, b.params);
       return json(data);
     } catch (e) { return json({ error: '代理失败: ' + e.message }, 500); }
   }
@@ -504,6 +573,11 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica N
 .result-box .rv{color:var(--text);font-weight:500;text-align:right}
 .secret-box{background:#fff7ed;border:1px solid #fdba74;border-radius:10px;padding:12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;font-size:13px;margin-top:8px}
 .panel{background:#fff;border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:12px;box-shadow:var(--shadow)}
+.renew-log{max-height:280px;overflow:auto;background:#0f172a;color:#e2e8f0;border-radius:10px;padding:10px 12px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;line-height:1.7}
+.renew-line.ok{color:#86efac}
+.renew-line.fail{color:#fca5a5}
+.renew-line.skip{color:#fcd34d}
+.renew-line.info{color:#93c5fd}
 .switch{position:relative;display:inline-block;width:46px;height:26px}
 .switch input{opacity:0;width:0;height:0}
 .slider{position:absolute;cursor:pointer;inset:0;background:#cbd5e1;border-radius:26px;transition:.2s}
@@ -648,6 +722,46 @@ function failed(r){
   if(r.success!==true&&r.error) return true;
   return false;
 }
+const RENEW_WINDOW_DAYS=180;
+let renewBusy=false;
+function parseExpires(s){
+  if(!s) return null;
+  const raw=String(s).trim();
+  if(/^\\d{10,13}$/.test(raw)){
+    const n=Number(raw);
+    const d=new Date(n<1e12?n*1000:n);
+    return Number.isNaN(d.getTime())?null:d;
+  }
+  let d=new Date(raw.includes('T')?raw:raw.replace(' ','T'));
+  if(Number.isNaN(d.getTime())) d=new Date(raw.replace(/-/g,'/'));
+  return Number.isNaN(d.getTime())?null:d;
+}
+function isNeverExpires(d){
+  return !!(d&&(d.never_expires===1||d.never_expires===true||d.never_expires==='1'));
+}
+function daysLeftOf(d){
+  if(isNeverExpires(d)) return null;
+  const exp=parseExpires(d&&d.expires_at);
+  if(!exp) return null;
+  return (exp.getTime()-Date.now())/86400000;
+}
+function renewLog(text,kind){
+  const panel=document.getElementById('renewLogPanel');
+  const box=document.getElementById('renewLog');
+  if(!panel||!box) return;
+  panel.style.display='block';
+  const row=document.createElement('div');
+  row.className='renew-line '+(kind||'info');
+  const t=new Date();
+  const hh=[t.getHours(),t.getMinutes(),t.getSeconds()].map(n=>String(n).padStart(2,'0')).join(':');
+  row.textContent=hh+'  '+text;
+  box.appendChild(row);
+  box.scrollTop=box.scrollHeight;
+}
+function clearRenewLog(){
+  const box=document.getElementById('renewLog');
+  if(box) box.innerHTML='';
+}
 function statusBadge(s){
   const cls=s==='active'?'badge-active':s==='pending'?'badge-pending':s==='suspended'||s==='expired'?'badge-inactive':'badge-info';
   return '<span class="badge '+cls+'">'+(STATUS_ZH[s]||s||'未知')+'</span>';
@@ -735,7 +849,7 @@ function renderAutoRenew(){
     </div>
     <div class="stats-bar">
       <div class="stat-card"><div class="label">开关</div><div class="value \${c.enabled?'text-success':'text-warning'}">\${c.enabled?'已开启':'已关闭'}</div></div>
-      <div class="stat-card"><div class="label">提前天数</div><div class="value text-primary">\${c.daysBefore??175}</div></div>
+      <div class="stat-card"><div class="label">提前天数</div><div class="value text-primary">\${c.daysBefore??180}</div></div>
       <div class="stat-card"><div class="label">上次运行</div><div class="value" style="font-size:14px">\${esc(c.lastRunAt||'-')}</div></div>
       <div class="stat-card"><div class="label">上次结果</div><div class="value" style="font-size:14px">\${last&&last.summary?('成功 '+(last.summary.renewed||0)+' / 失败 '+(last.summary.failed||0)):'-'}</div></div>
     </div>
@@ -745,11 +859,11 @@ function renderAutoRenew(){
         <label class="switch"><input type="checkbox" id="ar_enabled" \${c.enabled?'checked':''}><span class="slider"></span></label>
       </div>
       <div class="form-row">
-        <div class="form-group"><label>到期前多少天开始续期</label><input id="ar_days" type="number" min="1" max="365" value="\${c.daysBefore??175}"><div class="hint">官方免费窗口约到期前 180 天，建议 170–175。</div></div>
+        <div class="form-group"><label>到期前多少天开始续期</label><input id="ar_days" type="number" min="1" max="400" value="\${c.daysBefore??180}"><div class="hint">官方免费窗口是到期前 180 天。150 天内到期的会被续。请把这里设成 180。</div></div>
         <div class="form-group"><label>单次最多续期条数</label><input id="ar_max" type="number" min="1" max="300" value="\${c.maxPerRun??80}"><div class="hint">避免一次跑太久；剩余域名下次 Cron 继续。</div></div>
       </div>
       <div class="form-row">
-        <div class="form-group"><label>请求间隔（毫秒）</label><input id="ar_delay" type="number" min="300" max="5000" value="\${c.delayMs??1100}"><div class="hint">默认 1100，贴近 60 次/分钟限流。</div></div>
+        <div class="form-group"><label>请求频率</label><input value="每账号最多 30 次/分钟" disabled style="background:#f1f5f9"><div class="hint">页面、批量续期和定时任务都走这个上限，调不更快。</div></div>
         <div class="form-group"><label>仅这些状态</label><input id="ar_status" value="\${esc((c.statuses||[]).join(','))}" placeholder="active，留空表示全部"><div class="hint">逗号分隔，例如 active 或 active,suspended</div></div>
       </div>
       <div class="form-row">
@@ -791,7 +905,6 @@ async function saveAutoRenew(){
     enabled:document.getElementById('ar_enabled').checked,
     daysBefore:parseInt(document.getElementById('ar_days').value,10),
     maxPerRun:parseInt(document.getElementById('ar_max').value,10),
-    delayMs:parseInt(document.getElementById('ar_delay').value,10),
     statuses,
     accountIds,
     skipNeverExpires:document.getElementById('ar_skip_never').checked,
@@ -827,6 +940,10 @@ function renderAccountShell(){
       <div class="stat-card"><div class="label">已用 / 总额</div><div class="value text-warning" id="statUsed">-</div></div>
       <div class="stat-card"><div class="label">剩余配额</div><div class="value text-success" id="statAvail">-</div></div>
       <div class="stat-card"><div class="label">基础 + 邀请</div><div class="value" id="statBonus">-</div></div>
+    </div>
+    <div class="panel" id="renewLogPanel" style="display:none">
+      <div class="dns-header"><h4>续期日志</h4><button class="btn btn-sm btn-outline" onclick="clearRenewLog()">清空</button></div>
+      <div id="renewLog" class="renew-log"></div>
     </div>
     <div class="tabs">
       <button class="tab \${uiTab==='domains'?'active':''}" onclick="switchTab('domains')">域名</button>
@@ -999,7 +1116,9 @@ function changePage(p){
 }
 function renderDomainCard(d){
   const isOpen=expandedDomains.has(Number(d.id))||expandedDomains.has(d.id);
-  const exp=d.never_expires? '永不过期' : (d.expires_at?('到期 '+d.expires_at):'');
+  const left=daysLeftOf(d);
+  const leftText=isNeverExpires(d)||left==null?'':('剩余 '+Math.ceil(left)+' 天');
+  const exp=isNeverExpires(d)?'永不过期':(d.expires_at?('到期 '+d.expires_at):'');
   return \`
     <div class="domain-card" id="domain-\${d.id}">
       <div class="domain-header" onclick="toggleDomain(\${d.id})">
@@ -1012,6 +1131,7 @@ function renderDomainCard(d){
             <span>\${esc(d.subdomain||'')} · \${esc(d.rootdomain||'')}</span>
             \${d.created_at?'<span>创建 '+esc(d.created_at)+'</span>':''}
             \${exp?'<span>'+esc(exp)+'</span>':''}
+            \${leftText?'<span>'+esc(leftText)+'</span>':''}
           </div>
         </div>
         <div class="domain-actions">
@@ -1205,10 +1325,20 @@ async function showDomainDetail(id){
     <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">关闭</button></div>\`);
 }
 async function renewDomain(domId){
-  toast('正在续期...','info');
-  const r=await proxy(currentAcc.id,'subdomains','renew','POST',{subdomain_id:domId});
-  if(!failed(r)){toast(r.message||'续期成功','success');showRenewResult(r);loadDomains()}
-  else toast(apiErr(r),'error');
+  const known=(domainData[currentAcc.id]&&domainData[currentAcc.id].domains||[]).find(x=>String(x.id)===String(domId));
+  const name=known?domainName(known):('ID '+domId);
+  const left=known?daysLeftOf(known):null;
+  renewLog('续期 '+name+(left==null?'':'，剩余 '+Math.ceil(left)+' 天'),'info');
+  const r=await proxy(currentAcc.id,'subdomains','renew','POST',{subdomain_id:Number(domId)});
+  if(!failed(r)){
+    renewLog(name+' 成功'+(r.new_expires_at?'，新到期 '+r.new_expires_at:'')+(r.charged_amount!=null?'，扣费 '+r.charged_amount:'')+(r.message?'，'+r.message:''),'ok');
+    toast(r.message||'续期成功','success');
+    showRenewResult(r);
+    loadDomains();
+  }else{
+    renewLog(name+' 失败：'+apiErr(r),'fail');
+    toast(apiErr(r),'error');
+  }
 }
 function showRenewResult(r){
   const charge=r.charged_amount;
@@ -1228,39 +1358,68 @@ function showRenewResult(r){
     <div class="modal-footer"><button class="btn btn-primary" onclick="closeModal()">确定</button></div>\`);
 }
 async function renewAll(){
+  if(renewBusy){toast('续期还在进行，请看上方日志','warning');return}
   closeModal();
-  toast('正在按当前筛选条件拉取全部域名...','info');
-  const q=Object.assign({},domainQuery,{page:1,per_page:200});
+  renewBusy=true;
+  clearRenewLog();
+  renewLog('开始拉取全部域名。每个账号最多 30 次/分钟，请求会自动排队','info');
   const domains=[];
-  for(let i=0;i<100;i++){
-    const p={page:q.page,per_page:q.per_page,sort_by:q.sort_by,sort_dir:q.sort_dir,include_total:0};
-    if(q.search) p.search=q.search;
-    if(q.rootdomain) p.rootdomain=q.rootdomain;
-    if(q.status) p.status=q.status;
-    if(q.created_from) p.created_from=q.created_from;
-    if(q.created_to) p.created_to=q.created_to;
-    const r=await proxy(currentAcc.id,'subdomains','list','GET',null,p);
-    if(failed(r)){toast(apiErr(r),'error');return}
-    const list=r.subdomains||[];
-    domains.push(...list);
-    if(!(r.pagination&&r.pagination.has_more)||!list.length) break;
-    q.page++;
-    await new Promise(res=>setTimeout(res,400));
-  }
-  if(!domains.length){toast('没有可续期的域名','warning');return}
-  toast('开始续期 '+domains.length+' 个域名，约 1 秒一条','info');
-  let okN=0,failN=0,lastErr='',stopped=false;
-  for(const d of domains){
-    const r=await proxy(currentAcc.id,'subdomains','renew','POST',{subdomain_id:d.id});
-    if(!failed(r)) okN++;
-    else {
-      failN++; lastErr=apiErr(r);
-      if(r&&r.error_code==='rate_limit_exceeded'){stopped=true;break}
+  let page=1;
+  try{
+    for(let i=0;i<100;i++){
+      const r=await proxy(currentAcc.id,'subdomains','list','GET',null,{page,per_page:200,include_total:0,sort_by:'expires_at',sort_dir:'asc'});
+      if(failed(r)){renewLog('拉取第 '+page+' 页失败：'+apiErr(r),'fail');toast(apiErr(r),'error');return}
+      const list=r.subdomains||[];
+      domains.push(...list);
+      renewLog('已拉取第 '+page+' 页，'+list.length+' 条','info');
+      const more=r.pagination?!!r.pagination.has_more:list.length===200;
+      if(!more||!list.length) break;
+      page++;
     }
-    await new Promise(res=>setTimeout(res,1100));
+    domains.sort((a,b)=>{
+      const da=daysLeftOf(a), db=daysLeftOf(b);
+      if(da==null&&db==null) return 0;
+      if(da==null) return 1;
+      if(db==null) return -1;
+      return da-db;
+    });
+    const due=domains.filter(d=>{
+      if(isNeverExpires(d)) return false;
+      const left=daysLeftOf(d);
+      return left==null||left<=RENEW_WINDOW_DAYS;
+    });
+    const early=domains.length-due.length;
+    renewLog('共 '+domains.length+' 个域名，'+due.length+' 个在 '+RENEW_WINDOW_DAYS+' 天窗口内或缺少到期时间，跳过 '+early+' 个还早的','info');
+    if(!due.length){toast('没有进入续期窗口的域名','warning');return}
+    let okN=0,failN=0,skipN=0;
+    for(let i=0;i<due.length;i++){
+      const d=due[i];
+      const name=domainName(d);
+      const left=daysLeftOf(d);
+      const leftText=left==null?'到期时间未知':('剩余 '+Math.ceil(left)+' 天，到期 '+(d.expires_at||'-'));
+      renewLog('('+(i+1)+'/'+due.length+') '+name+' '+leftText+' → 请求续期','info');
+      const r=await proxy(currentAcc.id,'subdomains','renew','POST',{subdomain_id:Number(d.id)});
+      if(!failed(r)){
+        okN++;
+        renewLog(name+' 成功，新到期 '+(r.new_expires_at||'-')+'，扣费 '+(r.charged_amount??0)+(r.message?'，'+r.message:''),'ok');
+      }else if(r&&r.error_code==='renewal_not_yet_available'){
+        skipN++;
+        renewLog(name+' 接口拒绝：未到续期窗口。'+apiErr(r),'skip');
+      }else if(r&&r.error_code==='rate_limit_exceeded'){
+        failN++;
+        renewLog(name+' 触发频率限制，停止后续请求。'+apiErr(r),'fail');
+        break;
+      }else{
+        failN++;
+        renewLog(name+' 失败：'+apiErr(r),'fail');
+      }
+    }
+    renewLog('结束：成功 '+okN+'，失败 '+failN+'，窗口未开 '+skipN,'info');
+    toast('续期结束：成功 '+okN+'，失败 '+failN+'，窗口未开 '+skipN, failN?'warning':'success');
+    loadDomains();loadQuota();
+  }finally{
+    renewBusy=false;
   }
-  toast((stopped?'已触发频率限制并停止。':'续期完成：')+'成功 '+okN+'，失败 '+failN+(lastErr?'，最后错误：'+lastErr:''),(failN||stopped)?'warning':'success');
-  loadDomains();loadQuota();
 }
 async function deleteDomain(domId){
   const r=await proxy(currentAcc.id,'subdomains','delete','POST',{subdomain_id:domId});
@@ -1512,7 +1671,7 @@ function showModal(type,data){
     <div class="modal-footer"><button class="btn btn-outline" onclick="closeModal()">取消</button><button class="btn btn-danger" onclick="deleteDnsRecord(\${data.domId},\${rec.id!=null?rec.id:'null'},'\${escAttr(rec.record_id||'')}')">确认删除</button></div>\`;
   }else if(type==='confirmRenewAll'){
     html=\`<div class="modal-header"><h3>续期筛选结果</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
-    <div class="modal-body"><div class="confirm-text">将按当前搜索和筛选条件，逐页取出并续期全部匹配域名。赎回期续期可能扣账户余额，未到免费续期窗口会失败。域名较多时大约每秒处理一条。</div></div>
+    <div class="modal-body"><div class="confirm-text">会忽略当前搜索条件，按到期从近到远检查全部域名。只对 180 天内到期（或没有到期时间）的域名调用续期，过程显示在页面上方的续期日志里。页面开着才能看到日志。</div></div>
     <div class="modal-footer"><button class="btn btn-outline" onclick="closeModal()">取消</button><button class="btn btn-success" onclick="renewAll()">开始续期</button></div>\`;
   }else if(type==='addKey'){
     html=\`<div class="modal-header"><h3>创建 API 密钥</h3><button class="modal-close" onclick="closeModal()">✕</button></div>
